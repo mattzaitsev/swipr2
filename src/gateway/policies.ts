@@ -7,8 +7,7 @@
 import { config } from '../config';
 
 /**
- * Baseline values per source. Strategies adjust behavior at runtime through primitives (strategy.ts); these values
- * are the starting point, and for pacing and cooldowns also the floor (guardrails.ts).
+ * Baseline values per source. Strategies adjust behavior at runtime through primitives (strategy.ts).
  */
 export interface SourcePolicy {
   minIntervalMs: number;             // politeness: minimum gap between requests to this source (per process); pacing floor

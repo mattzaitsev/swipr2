@@ -116,8 +116,6 @@ export async function start() {
     ? `proxy ${describeProxy()} for [${config.proxy.sources.join(', ')}], direct for the rest`
     : 'all direct (PROXY_URL not set)';
   log(`${searches} searches scheduled (new + refresh); outbound: ${outbound}`);
-  const identitySources = config.requestStrategy.headers.connectorIdentitySources;
-  if (identitySources.length) log(`connector identity headers ENABLED for [${identitySources.join(', ')}] (pinned per source)`);
   return async () => {
     await worker.close();
     await queue.close();

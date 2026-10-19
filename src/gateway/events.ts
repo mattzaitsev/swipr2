@@ -35,7 +35,6 @@ export type GatewayEvent = Base &
     | { type: 'cooldown.decided'; verdict: Verdict; ms: number; scope: 'search' | 'source'; reason: string }
     | { type: 'pacing.changed'; minIntervalMs: number; reason: string }
     | { type: 'concurrency.changed'; limit: number; reason: string }
-    | { type: 'guardrail.applied'; rule: 'identity-headers' | 'cooldown-floor' | 'identity-change'; detail: string }
     | { type: 'strategy.note'; name: string; labels: Record<string, string | number> }
   );
 

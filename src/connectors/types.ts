@@ -81,9 +81,7 @@ export interface Connector {
   /** Pure: raw payload -> ListingDraft, or null to skip. Separate from crawl() so raw_events can be re-parsed. */
   parse(item: RawItem): ListingDraft | null;
 
-  /** Per-request protocol headers (content type, accept, ...). Source-specific header adjustments live here.
-   *  Identity headers (user-agent, sec-ch-ua*) returned here are stripped unless this source is listed in
-   *  CONNECTOR_IDENTITY_HEADERS; when it is, the first values are pinned for the source (no per-request changes). */
+  /** Per-request protocol headers (content type, accept, ...). Source-specific header adjustments live here. */
   requestHeaders?(req: FlowRequest, flow: { kind: string; task: CrawlTask }): Record<string, string>;
 
   /** Read source-specific signals in a response: errors inside an HTTP 200, login walls, a changed shape.

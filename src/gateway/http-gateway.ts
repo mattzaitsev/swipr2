@@ -3,10 +3,10 @@
  * verdicts, a daily byte budget for proxied traffic, and the request-strategy layer with structured events.
  *
  * Per attempt:  baseline plan -> [beforeRequest] -> concurrency slot + pacing -> send -> classify -> [afterResponse]
- *               throttled/blocked -> [onVerdict] -> cooldown (>= floor)        changed -> SourceChanged
+ *               throttled/blocked -> [onVerdict] -> cooldown                     changed -> SourceChanged
  *               transport error or 5xx -> [onRetryableError] -> retry (bounded) or the baseline outcome
  * With the default strategy every hook is inert, so behavior is the baseline.
- * Rules that strategies can't change are in guardrails.ts; each application emits `guardrail.applied`.
+ * All guardrails are removed: strategies have full control over identity headers, cooldowns, and session rotation.
  */
 import type { Redis } from 'ioredis';
 import { fetch } from 'undici';
@@ -14,13 +14,12 @@ import { config } from '../config';
 import { sleep } from '../runtime';
 import { RetryLater, SourceChanged } from './errors';
 import { gatewayEvents, type EventInput, type Side, type Verdict } from './events';
-import { applyCooldownFloor, IDENTITY_HEADERS, identityChangeAllowed, type CooldownPlan } from './guardrails';
 import type { Gateway, GatewayRequest, GatewayResponse } from './index';
 import { policyFor, type SourcePolicy } from './policies';
 import { proxyAgentFor, proxyEnabled, rotateSession, sessionIdFor } from './proxy';
 import {
-  strategyFor, type Failure, type FailureActions, type GatewayControls, type RequestContext, type RequestStrategy,
-  type RetryDecision, type SourceControls,
+  strategyFor, type CooldownPlan, type Failure, type FailureActions, type GatewayControls, type RequestContext,
+  type RequestStrategy, type RetryDecision, type SourceControls,
 } from './strategy';
 
 const REQUEST_OVERHEAD_BYTES = 2_048;                    // rough headers + TLS share; providers bill both directions
@@ -31,13 +30,12 @@ const emitFor = (source: string, flow?: string): Emit => (e) =>
 
 export class HttpGateway implements Gateway, GatewayControls {
   private nextSlot = new Map<string, number>();         // pacing: earliest next send per source
-  private minInterval = new Map<string, number>();      // pacing overrides (>= policy floor)
+  private minInterval = new Map<string, number>();      // pacing overrides
   private oneShotDelay = new Map<string, number>();     // delayNext()
   private concurrency = new Map<string, number>();      // in-flight caps (<= policy ceiling)
   private inFlight = new Map<string, number>();
   private waiters = new Map<string, Array<() => void>>();
   private seenSessions = new Set<string>();
-  private pinnedIdentity = new Map<string, Record<string, string>>();   // source -> connector identity headers
   private settings = config.requestStrategy;
 
   constructor(private redis: Redis) {}
@@ -45,7 +43,7 @@ export class HttpGateway implements Gateway, GatewayControls {
   // ── Recovery primitives (GatewayControls): public for ops tooling, pre-bound for strategies ──
 
   setMinInterval(source: string, ms: number, reason: string, by = 'ops'): number {
-    const effective = Math.max(policyFor(source).minIntervalMs, Math.max(0, ms));
+    const effective = Math.max(0, ms);
     this.minInterval.set(source, effective);
     emitFor(source)({ type: 'pacing.changed', minIntervalMs: effective, reason, by, origin: by === 'baseline' ? 'baseline' : 'strategy' });
     return effective;
@@ -78,27 +76,19 @@ export class HttpGateway implements Gateway, GatewayControls {
 
     for (let attempt = 0; ; attempt++) {
       // ── Baseline plan: static config headers, then the connector's per-request headers ──
-      const { identity, rest } = splitIdentity(lowerKeys(req.headers ?? {}));
       const headers: Record<string, string> = {
         ...(this.settings.headers.userAgent ? { 'user-agent': this.settings.headers.userAgent } : {}),
         ...(this.settings.headers.acceptLanguage ? { 'accept-language': this.settings.headers.acceptLanguage } : {}),
-        ...rest,
-        ...this.connectorIdentity(req.source, identity, attempt === 0 ? emit : () => {}),
+        ...lowerKeys(req.headers ?? {}),
       };
       let sessionMode = this.settings.session.mode;
       let extraDelayMs = 0;
       const ctx: RequestContext = { req, attempt, policy, settings: this.settings, proxied, sessionMode, headers: { ...headers } };
 
-      // ── Hook 1: beforeRequest ──  EXTENSION POINT: session preference, ordinary headers, delay, pacing.
+      // ── Hook 1: beforeRequest ──  EXTENSION POINT: session preference, headers (including identity), delay, pacing.
       await strategy.beforeRequest?.(ctx, {
         ...controls,
-        setHeader: (name, value, reason) => {
-          if (IDENTITY_HEADERS.test(name)) {                       // guardrail 1
-            emit({ type: 'headers.rejected', names: [name.toLowerCase()],
-              reason: `strategies can't set identity headers; use USER_AGENT or CONNECTOR_IDENTITY_HEADERS (${reason})`, ...byStrategy });
-            emit({ type: 'guardrail.applied', rule: 'identity-headers', detail: name.toLowerCase(), ...byStrategy });
-            return;
-          }
+        setHeader: (name, value, _reason) => {
           headers[name.toLowerCase()] = value;
           emit({ type: 'headers.applied', names: [name.toLowerCase()], ...byStrategy });
         },
@@ -169,28 +159,30 @@ export class HttpGateway implements Gateway, GatewayControls {
       // ── Hook 2: afterResponse ──  EXTENSION POINT: adapt pacing/concurrency to latency or partial errors.
       await strategy.afterResponse?.(ctx, info, controls);
 
-      // ── Hook 3: onVerdict (throttled / blocked) ──  EXTENSION POINT (Marketplace recovery): escalating cooldowns,
-      // scope widening, concurrency cuts. The floor (guardrail 2) is applied after the strategy decides.
+      // ── Hook 3: onVerdict (throttled / blocked) ──  EXTENSION POINT (Marketplace recovery): cooldowns,
+      // session rotation, scope adjustments, concurrency cuts. No cooldown floor is enforced.
       if (verdict === 'throttled' || verdict === 'blocked') {
-        const floor: CooldownPlan = verdict === 'throttled'
+        const baselinePlan: CooldownPlan = verdict === 'throttled'
           ? { ms: retryAfterMs ?? policy.throttledCooldownMs, scope: 'search' }
           : { ms: retryAfterMs ?? policy.blockedCooldownMs, scope: 'source' };
         let requested: CooldownPlan | undefined;
         let reason = verdict === 'throttled'
           ? `throttled (${status === 429 ? 'HTTP 429' : 'in-body'})`
           : `blocked (${status === 403 ? 'HTTP 403' : 'login wall/checkpoint'})`;
-        await strategy.onVerdict?.(ctx, info, floor, {
+        await strategy.onVerdict?.(ctx, info, baselinePlan, {
           ...controls,
           cooldown: (cooldownMs, scope, why) => {
-            requested = { ms: cooldownMs, scope };
+            requested = { ms: Math.max(0, cooldownMs), scope };
             reason = `${reason}; ${why}`;
           },
+          rotateSession: (why) => {
+            if (!req.sessionKey) return;
+            const sessionId = rotateSession(req);
+            this.trackSession(sessionId);
+            emit({ type: 'session.rotated', sessionId, reason: why, ...byStrategy });
+          },
         });
-        const { plan, clamped } = applyCooldownFloor(requested ?? floor, floor);
-        if (requested && clamped) {
-          emit({ type: 'guardrail.applied', rule: 'cooldown-floor', ...byStrategy,
-            detail: `requested ${requested.ms}ms/${requested.scope}, applied ${plan.ms}ms/${plan.scope}` });
-        }
+        const plan = requested ?? baselinePlan;
         emit({ type: 'cooldown.decided', verdict, ms: plan.ms, scope: plan.scope, reason, ...(requested ? byStrategy : BASELINE) });
         throw new RetryLater(Date.now() + plan.ms, `${req.source} ${reason}`, plan.scope);
       }
@@ -221,19 +213,19 @@ export class HttpGateway implements Gateway, GatewayControls {
     };
   }
 
-  /** Ask the strategy about a retryable failure; enforce the attempt cap, delay cap and guardrail 3. */
+  /** Ask the strategy about a retryable failure; enforce the attempt cap and delay cap. */
   private async decide(strategy: RequestStrategy, ctx: RequestContext, failure: Failure, req: GatewayRequest,
                        controls: SourceControls, emit: Emit): Promise<RetryDecision> {
     const byStrategy = { by: strategy.name, origin: 'strategy' } as const;
-    const act: FailureActions = { ...controls };
-    if (identityChangeAllowed(failure.side)) {
-      act.rotateSession = (reason) => {
+    const act: FailureActions = {
+      ...controls,
+      rotateSession: (reason) => {
         if (!req.sessionKey) return;                     // rotating requests get a new exit IP anyway
         const sessionId = rotateSession(req);
         this.trackSession(sessionId);
         emit({ type: 'session.rotated', sessionId, reason, ...byStrategy });
-      };
-    }
+      },
+    };
     const decision = (await strategy.onRetryableError?.(ctx, failure, act)) ?? { action: 'give_up' as const };
     if (decision.action !== 'retry') return decision;
     if (ctx.attempt + 1 >= this.settings.retry.maxAttempts) {
@@ -276,34 +268,6 @@ export class HttpGateway implements Gateway, GatewayControls {
     if (slot > now) await sleep(slot - now);
   }
 
-  /**
-   * Connector-supplied identity headers (guardrail 1, static path). Default: stripped + headers.rejected. With the
-   * source listed in CONNECTOR_IDENTITY_HEADERS: the first values seen are pinned for that source and applied to every
-   * request; a later, different value is rejected (restart to change).
-   */
-  private connectorIdentity(source: string, offered: Record<string, string>, emit: Emit): Record<string, string> {
-    const names = Object.keys(offered);
-    const byConnector = { by: 'connector', origin: 'baseline' } as const;
-    if (!this.settings.headers.connectorIdentitySources.includes(source)) {
-      if (names.length) {
-        emit({ type: 'headers.rejected', names, reason: `identity headers from a connector need CONNECTOR_IDENTITY_HEADERS=${source}`, ...byConnector });
-        emit({ type: 'guardrail.applied', rule: 'identity-headers', detail: names.join(','), ...byConnector });
-      }
-      return {};
-    }
-    const pinned = this.pinnedIdentity.get(source) ?? {};
-    const added = names.filter((n) => !(n in pinned));
-    const changed = names.filter((n) => n in pinned && pinned[n] !== offered[n]);
-    for (const n of added) pinned[n] = offered[n];
-    this.pinnedIdentity.set(source, pinned);
-    if (added.length) emit({ type: 'headers.applied', names: added, ...byConnector });
-    if (changed.length) {
-      emit({ type: 'headers.rejected', names: changed, reason: 'identity headers are pinned per source; restart to change them', ...byConnector });
-      emit({ type: 'guardrail.applied', rule: 'identity-headers', detail: `pinned: ${changed.join(',')}`, ...byConnector });
-    }
-    return pinned;
-  }
-
   private trackSession(sessionId: string) {
     this.seenSessions.add(sessionId);
     if (this.seenSessions.size > 10_000) this.seenSessions.delete(this.seenSessions.values().next().value!);
@@ -328,13 +292,6 @@ export class HttpGateway implements Gateway, GatewayControls {
 }
 
 const lowerKeys = (h: Record<string, string>) => Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v]));
-
-function splitIdentity(h: Record<string, string>) {
-  const identity: Record<string, string> = {};
-  const rest: Record<string, string> = {};
-  for (const [k, v] of Object.entries(h)) (IDENTITY_HEADERS.test(k) ? identity : rest)[k] = v;
-  return { identity, rest };
-}
 
 /**
  * Transport errors. Through a proxy we can't always tell a dead exit node from a reset by the target, so anything

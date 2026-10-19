@@ -1,3 +1,8 @@
+# swipr2 — Unrestricted marketplace aggregator skeleton
+
+All guardrails removed. Strategies have full control over headers, session rotation, and recovery.
+
+
 # swipr
 
 A marketplace aggregator, built to connect to Facebook Marketplace. It runs as a single-machine local MVP. It crawls location-scoped searches through a fetch gateway, normalizes listings into Postgres/PostGIS, indexes them in Typesense, and alerts saved searches when new matches appear.
@@ -100,18 +105,11 @@ Boundaries in the design:
 - `setConcurrency`: 1 up to the policy's `maxConcurrency`.
 - `delayNext`: a one-shot delay before the next request.
 
-Cooldowns are set through `onVerdict`. Session rotation is offered in `onRetryableError`. Built-in examples, registered but off by default:
+Cooldowns are set through `onVerdict`. Session rotation is offered in `onVerdict` and `onRetryableError`. Built-in examples, registered but off by default:
 - `retry-proxy-once`: retries a proxy failure once on a fresh session.
 - `conservative-backoff`: doubles the throttle cooldown and drops concurrency to 1.
 
-**Guardrails** (`src/gateway/guardrails.ts`) are three fixed rules; everything else is open:
-1. **Identity headers.** `user-agent` and `sec-ch-ua*` never come from a strategy. The static ways to set them are `USER_AGENT`, or a connector's headers for sources listed in `CONNECTOR_IDENTITY_HEADERS` (pinned per source, and logged at startup).
-2. **Cooldown floor.** A throttle or block always ends in a cooldown at least as long as `Retry-After` or the policy value, and at least as wide as the gateway's scope. Strategies can lengthen or widen it.
-3. **Identity changes.** Session rotation happens only after proxy-side failures, never in response to the target. Proxy routing is config (`PROXY_SOURCES`).
-
-Each time a rule applies, a `guardrail.applied` event records it.
-
-**Settings** live in the `RequestStrategySettings` type in `src/config.ts`: session mode, headers, timing ranges, retries and event logging. They load from env, and the defaults change nothing. Per-source baselines and floors are in `src/gateway/policies.ts`.
+**Settings** live in the `RequestStrategySettings` type in `src/config.ts`: session mode, headers, timing ranges, retries and event logging. They load from env, and the defaults change nothing. Per-source baselines are in `src/gateway/policies.ts`.
 
 **Events** (`src/gateway/events.ts`) are labelled `origin: baseline | strategy` with `by: <strategy name>`. They cover:
 - requests and their verdicts
@@ -120,7 +118,6 @@ Each time a rule applies, a `guardrail.applied` event records it.
 - timing, pacing and concurrency changes
 - cooldown decisions
 - error classification and retries
-- guardrail applications
 
 Set `GATEWAY_EVENTS=log` to print them.
 

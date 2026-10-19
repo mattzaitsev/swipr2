@@ -37,17 +37,10 @@ export interface RequestStrategySettings {
     ttlMin: number;
   };
   headers: {
-    /** One static User-Agent for all requests, or '' for the HTTP client's default. Env USER_AGENT. Never set by strategies. */
+    /** Baseline User-Agent for requests, or '' for the HTTP client's default. Env USER_AGENT. Strategies may override per request. */
     userAgent: string;
     /** Accept-Language sent with every request, or '' for none. Env ACCEPT_LANGUAGE (e.g. "en-US,en;q=0.9"). */
     acceptLanguage: string;
-    /**
-     * Sources whose *connector* may supply identity headers (user-agent, sec-ch-ua*) through requestHeaders() or
-     * flow headers. Opt-in per source; default none, and unlisted sources get them stripped with a headers.rejected
-     * event. Values are pinned per source for the life of the process: the first value wins, later different values
-     * are rejected (restart to change). Strategies can never set these. Env CONNECTOR_IDENTITY_HEADERS="mock,facebook".
-     */
-    connectorIdentitySources: string[];
   };
   timing: {
     /** Extra random delay [min, max] ms a strategy may add before each request. Env REQUEST_JITTER_MS="0-0" (off). */
@@ -121,7 +114,6 @@ export const config = {
     headers: {
       userAgent: env('USER_AGENT', ''),
       acceptLanguage: env('ACCEPT_LANGUAGE', ''),
-      connectorIdentitySources: env('CONNECTOR_IDENTITY_HEADERS', '').split(',').map((s) => s.trim()).filter(Boolean),
     },
     timing: {
       extraDelayMs: parseRange(env('REQUEST_JITTER_MS', '0-0')),
