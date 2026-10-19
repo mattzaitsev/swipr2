@@ -19,6 +19,7 @@ import { describeProxy, proxyEnabled } from '../gateway/proxy';
 import { bullConnection, createRedis } from '../redis';
 import { isMain, logger, runMain } from '../runtime';
 import { normalize, type NormalizeResult } from './normalize';
+import { applyCooldown } from './cooldown';
 
 const log = logger('ingest');
 const deferKey = (t: CrawlTask) => `swipr:defer:${searchId(t)}`;   // shared by both modes: a cooldown pauses the search
@@ -87,9 +88,8 @@ export async function start() {
         // "Not now": remember it for this search and let scheduled runs skip until then. Nothing fails, nothing piles up,
         // and items already normalized are kept (normalize is idempotent).
         if (err instanceof RetryLater) {
-          const waitMs = Math.max(1_000, err.retryAt - Date.now());
           const key = err.scope === 'source' ? sourcePauseKey(task.source) : deferKey(task);
-          const first = await redis.set(key, err.reason, 'PX', waitMs, 'NX');
+          const { waitMs, first } = await applyCooldown(redis, key, err);
           if (first) log(`${err.scope === 'source' ? `all ${task.source} searches` : searchId(task)} paused ${Math.round(waitMs / 1000)}s: ${err.reason}`);
           return { ...counts, deferred: true };
         }

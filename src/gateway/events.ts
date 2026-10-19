@@ -29,6 +29,7 @@ export type GatewayEvent = Base &
     | { type: 'headers.applied'; names: string[] }
     | { type: 'headers.rejected'; names: string[]; reason: string }
     | { type: 'timing.adjusted'; delayMs: number; reason: string }
+    | { type: 'timeout.changed'; timeoutMs: number; reason: string }
     | { type: 'error.classified'; attempt: number; side: Side; kind: string; message: string }
     | { type: 'retry.scheduled'; attempt: number; side: Side; delayMs: number; reason: string }
     | { type: 'retry.refused'; attempt: number; side: Side; reason: string }

@@ -45,12 +45,8 @@ export interface RequestStrategySettings {
   timing: {
     /** Extra random delay [min, max] ms a strategy may add before each request. Env REQUEST_JITTER_MS="0-0" (off). */
     extraDelayMs: [number, number];
-    /** Cap on any single strategy-added delay. Env STRATEGY_MAX_DELAY_MS. */
-    maxStrategyDelayMs: number;
   };
   retry: {
-    /** Total attempts per gateway request; 1 = never retry (baseline). Env REQUEST_MAX_ATTEMPTS. */
-    maxAttempts: number;
     /** Starting delay strategies use for retries. Env RETRY_BASE_DELAY_MS. */
     baseDelayMs: number;
   };
@@ -102,7 +98,6 @@ export const config = {
     password: env('PROXY_PASSWORD', ''),
     usernameTemplate: env('PROXY_USERNAME_TEMPLATE', '{user}'),   // sticky TTL: requestStrategy.session.ttlMin
     sources: env('PROXY_SOURCES', 'facebook').split(',').map((s) => s.trim()).filter(Boolean),
-    dailyMb: num('PROXY_DAILY_MB', 200),               // hard stop for paid bandwidth; 0 = no limit
   },
 
   requestStrategy: {
@@ -117,10 +112,8 @@ export const config = {
     },
     timing: {
       extraDelayMs: parseRange(env('REQUEST_JITTER_MS', '0-0')),
-      maxStrategyDelayMs: num('STRATEGY_MAX_DELAY_MS', 30_000),
     },
     retry: {
-      maxAttempts: Math.max(1, num('REQUEST_MAX_ATTEMPTS', 1)),
       baseDelayMs: num('RETRY_BASE_DELAY_MS', 1_000),
     },
     events: env('GATEWAY_EVENTS', 'off') === 'log' ? 'log' : 'off',

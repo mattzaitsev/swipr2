@@ -22,7 +22,8 @@
     "api": "tsx src/api/server.ts",
     "reindex": "tsx src/scripts/reindex.ts",
     "smoke": "tsx src/scripts/smoke.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/gateway/*.test.ts src/ingest/*.test.ts"
   },
   "dependencies": {
     "bullmq": "^6.3.17",

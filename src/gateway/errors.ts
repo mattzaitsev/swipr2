@@ -1,5 +1,5 @@
 /**
- * "Not now" (throttled, blocked, out of budget). The worker skips work until `retryAt`; it never fails it.
+ * "Not now" (e.g. throttled or blocked). The worker skips work until `retryAt`; it never fails it.
  * scope 'search' pauses one search; 'source' pauses every search on that source (e.g. a login wall hits the whole IP).
  */
 export class RetryLater extends Error {

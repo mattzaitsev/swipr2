@@ -1,12 +1,12 @@
 /**
  * Beta gateway: direct or proxied HTTP (per source), pacing and concurrency per source, cooldowns from response
- * verdicts, a daily byte budget for proxied traffic, and the request-strategy layer with structured events.
+ * verdicts, proxied byte metering, and the request-strategy layer with structured events.
  *
  * Per attempt:  baseline plan -> [beforeRequest] -> concurrency slot + pacing -> send -> classify -> [afterResponse]
  *               throttled/blocked -> [onVerdict] -> cooldown                     changed -> SourceChanged
- *               transport error or 5xx -> [onRetryableError] -> retry (bounded) or the baseline outcome
+ *               transport error or 5xx -> [onRetryableError] -> retry or the baseline outcome
  * With the default strategy every hook is inert, so behavior is the baseline.
- * All guardrails are removed: strategies have full control over identity headers, cooldowns, and session rotation.
+ * Strategies control headers, pacing, concurrency, timeouts, cooldowns, retries, and session rotation.
  */
 import type { Redis } from 'ioredis';
 import { fetch } from 'undici';
@@ -32,7 +32,7 @@ export class HttpGateway implements Gateway, GatewayControls {
   private nextSlot = new Map<string, number>();         // pacing: earliest next send per source
   private minInterval = new Map<string, number>();      // pacing overrides
   private oneShotDelay = new Map<string, number>();     // delayNext()
-  private concurrency = new Map<string, number>();      // in-flight caps (<= policy ceiling)
+  private concurrency = new Map<string, number>();      // strategy-selected in-flight caps
   private inFlight = new Map<string, number>();
   private waiters = new Map<string, Array<() => void>>();
   private seenSessions = new Set<string>();
@@ -50,7 +50,7 @@ export class HttpGateway implements Gateway, GatewayControls {
   }
 
   setConcurrency(source: string, limit: number, reason: string, by = 'ops'): number {
-    const effective = Math.min(policyFor(source).maxConcurrency, Math.max(1, Math.floor(limit)));
+    const effective = Math.max(1, Math.floor(limit));
     this.concurrency.set(source, effective);
     this.wake(source);
     emitFor(source)({ type: 'concurrency.changed', limit: effective, reason, by, origin: by === 'baseline' ? 'baseline' : 'strategy' });
@@ -58,7 +58,7 @@ export class HttpGateway implements Gateway, GatewayControls {
   }
 
   delayNext(source: string, ms: number, reason: string, by = 'ops'): number {
-    const d = Math.min(Math.max(0, ms), this.settings.timing.maxStrategyDelayMs);
+    const d = Math.max(0, ms);
     this.oneShotDelay.set(source, Math.max(this.oneShotDelay.get(source) ?? 0, d));
     emitFor(source)({ type: 'timing.adjusted', delayMs: d, reason: `next request: ${reason}`, by, origin: by === 'baseline' ? 'baseline' : 'strategy' });
     return d;
@@ -82,6 +82,7 @@ export class HttpGateway implements Gateway, GatewayControls {
         ...lowerKeys(req.headers ?? {}),
       };
       let sessionMode = this.settings.session.mode;
+      let timeoutMs = policy.timeoutMs;
       let extraDelayMs = 0;
       const ctx: RequestContext = { req, attempt, policy, settings: this.settings, proxied, sessionMode, headers: { ...headers } };
 
@@ -93,9 +94,13 @@ export class HttpGateway implements Gateway, GatewayControls {
           emit({ type: 'headers.applied', names: [name.toLowerCase()], ...byStrategy });
         },
         addDelay: (ms, reason) => {
-          const d = Math.min(Math.max(0, ms), this.settings.timing.maxStrategyDelayMs);
+          const d = Math.max(0, ms);
           extraDelayMs += d;
           emit({ type: 'timing.adjusted', delayMs: d, reason, ...byStrategy });
+        },
+        setTimeout: (ms, reason) => {
+          timeoutMs = Math.max(0, ms);
+          emit({ type: 'timeout.changed', timeoutMs, reason, ...byStrategy });
         },
         useSessionMode: (mode, reason) => {
           if (mode === sessionMode) return;
@@ -112,7 +117,6 @@ export class HttpGateway implements Gateway, GatewayControls {
       let ms: number;
       try {
         await this.waitTurn(req.source, policy, extraDelayMs);
-        if (proxied) await this.checkBudget(req.source);
         const sticky = !!req.sessionKey && sessionMode === 'sticky';
         const sessionId = proxied && sticky ? sessionIdFor(req) : undefined;
         if (sessionId && !this.seenSessions.has(sessionId)) {
@@ -127,14 +131,13 @@ export class HttpGateway implements Gateway, GatewayControls {
           headers,
           body: req.body,
           dispatcher: proxied ? proxyAgentFor(req, sessionId) : undefined,
-          signal: AbortSignal.timeout(policy.timeoutMs),
+          signal: timeoutMs > 0 && Number.isFinite(timeoutMs) ? AbortSignal.timeout(timeoutMs) : undefined,
         });
         status = res.status;
         resHeaders = res.headers as unknown as Headers;
         body = Buffer.from(await res.arrayBuffer());
         ms = Math.round(performance.now() - started);
       } catch (err) {
-        if (err instanceof RetryLater) throw err;              // budget exhausted
         release();
         // ── Hook 4a: transport failure (timeout, refused, proxy error) ──
         const failure = classifyError(err, proxied);
@@ -159,17 +162,18 @@ export class HttpGateway implements Gateway, GatewayControls {
       // ── Hook 2: afterResponse ──  EXTENSION POINT: adapt pacing/concurrency to latency or partial errors.
       await strategy.afterResponse?.(ctx, info, controls);
 
-      // ── Hook 3: onVerdict (throttled / blocked) ──  EXTENSION POINT (Marketplace recovery): cooldowns,
+      // ── Hook 3: onVerdict (throttled / blocked / changed) ── custom recovery or baseline handling.
       // session rotation, scope adjustments, concurrency cuts. No cooldown floor is enforced.
-      if (verdict === 'throttled' || verdict === 'blocked') {
+      if (verdict === 'throttled' || verdict === 'blocked' || verdict === 'changed') {
         const baselinePlan: CooldownPlan = verdict === 'throttled'
           ? { ms: retryAfterMs ?? policy.throttledCooldownMs, scope: 'search' }
-          : { ms: retryAfterMs ?? policy.blockedCooldownMs, scope: 'source' };
+          : { ms: verdict === 'changed' ? policy.changedPauseMs : retryAfterMs ?? policy.blockedCooldownMs, scope: 'source' };
         let requested: CooldownPlan | undefined;
         let reason = verdict === 'throttled'
           ? `throttled (${status === 429 ? 'HTTP 429' : 'in-body'})`
+          : verdict === 'changed' ? 'unexpected response body'
           : `blocked (${status === 403 ? 'HTTP 403' : 'login wall/checkpoint'})`;
-        await strategy.onVerdict?.(ctx, info, baselinePlan, {
+        const decision = await strategy.onVerdict?.(ctx, info, baselinePlan, {
           ...controls,
           cooldown: (cooldownMs, scope, why) => {
             requested = { ms: Math.max(0, cooldownMs), scope };
@@ -182,11 +186,17 @@ export class HttpGateway implements Gateway, GatewayControls {
             emit({ type: 'session.rotated', sessionId, reason: why, ...byStrategy });
           },
         });
+        if (decision?.action === 'retry') {
+          const retry = this.scheduleRetry(ctx, decision, 'target', strategy.name, emit);
+          await sleep(retry.delayMs);
+          continue;
+        }
+        if (decision?.action === 'return') return { status, headers: Object.fromEntries(resHeaders), body };
+        if (verdict === 'changed' && !requested) throw new SourceChanged(req.source, 'unexpected response body');
         const plan = requested ?? baselinePlan;
         emit({ type: 'cooldown.decided', verdict, ms: plan.ms, scope: plan.scope, reason, ...(requested ? byStrategy : BASELINE) });
         throw new RetryLater(Date.now() + plan.ms, `${req.source} ${reason}`, plan.scope);
       }
-      if (verdict === 'changed') throw new SourceChanged(req.source, 'unexpected response body');
 
       if (status >= 500) {
         // ── Hook 4b: target server error ──
@@ -213,7 +223,7 @@ export class HttpGateway implements Gateway, GatewayControls {
     };
   }
 
-  /** Ask the strategy about a retryable failure; enforce the attempt cap and delay cap. */
+  /** Ask the strategy about a retryable failure. The strategy owns its retry policy. */
   private async decide(strategy: RequestStrategy, ctx: RequestContext, failure: Failure, req: GatewayRequest,
                        controls: SourceControls, emit: Emit): Promise<RetryDecision> {
     const byStrategy = { by: strategy.name, origin: 'strategy' } as const;
@@ -228,12 +238,13 @@ export class HttpGateway implements Gateway, GatewayControls {
     };
     const decision = (await strategy.onRetryableError?.(ctx, failure, act)) ?? { action: 'give_up' as const };
     if (decision.action !== 'retry') return decision;
-    if (ctx.attempt + 1 >= this.settings.retry.maxAttempts) {
-      emit({ type: 'retry.refused', attempt: ctx.attempt, side: failure.side, reason: `REQUEST_MAX_ATTEMPTS=${this.settings.retry.maxAttempts}`, ...byStrategy });
-      return { action: 'give_up' };
-    }
-    const delayMs = Math.min(Math.max(0, decision.delayMs), this.settings.timing.maxStrategyDelayMs);
-    emit({ type: 'retry.scheduled', attempt: ctx.attempt, side: failure.side, delayMs, reason: decision.reason, ...byStrategy });
+    return this.scheduleRetry(ctx, decision, failure.side, strategy.name, emit);
+  }
+
+  private scheduleRetry(ctx: RequestContext, decision: Extract<RetryDecision, { action: 'retry' }>,
+                        side: Side, by: string, emit: Emit) {
+    const delayMs = Math.max(0, decision.delayMs);
+    emit({ type: 'retry.scheduled', attempt: ctx.attempt, side, delayMs, reason: decision.reason, by, origin: 'strategy' });
     return { ...decision, delayMs };
   }
 
@@ -273,20 +284,10 @@ export class HttpGateway implements Gateway, GatewayControls {
     if (this.seenSessions.size > 10_000) this.seenSessions.delete(this.seenSessions.values().next().value!);
   }
 
-  private budgetKey = () => `swipr:proxy-bytes:${new Date().toISOString().slice(0, 10)}`;
-
-  private async checkBudget(source: string) {
-    if (config.proxy.dailyMb <= 0) return;
-    const used = Number(await this.redis.get(this.budgetKey())) || 0;
-    if (used >= config.proxy.dailyMb * 1024 * 1024) {
-      const tomorrow = new Date();
-      tomorrow.setUTCHours(24, 0, 0, 0);
-      throw new RetryLater(tomorrow.getTime(), `${source}: proxy budget of ${config.proxy.dailyMb} MB/day used`, 'source');
-    }
-  }
+  private usageKey = () => `swipr:proxy-bytes:${new Date().toISOString().slice(0, 10)}`;
 
   private async meter(bytes: number) {
-    const key = this.budgetKey();
+    const key = this.usageKey();
     await this.redis.multi().incrby(key, bytes).expire(key, 3 * 86_400).exec();
   }
 }

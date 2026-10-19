@@ -5,7 +5,7 @@
  *  - direct or env-configured proxy
  *  - per-source pacing and cooldowns
  *  - request strategies (src/gateway/strategy.ts) and structured events (src/gateway/events.ts)
- *  - a proxy byte budget
+ *  - proxy byte metering
  * The full FetchGateway (health tracking, breaker, recovery strategies) replaces it inside `createGateway()`
  * and calls the same strategy hooks at the same points; nothing else changes.
  */

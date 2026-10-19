@@ -22,7 +22,7 @@
  *  4. Add a detail fetch (second doc_id) for description, condition, all photos, and removal detection for listings
  *     whose last_seen_at goes stale. Absence from search results is not proof of removal.
  *  5. Tune policies.facebook (pacing, cooldowns) and classifyMarketplace() against real throttle/block responses.
- *     Set PROXY_URL / PROXY_USERNAME / PROXY_PASSWORD / PROXY_USERNAME_TEMPLATE and a PROXY_DAILY_MB budget.
+ *     Set PROXY_URL / PROXY_USERNAME / PROXY_PASSWORD / PROXY_USERNAME_TEMPLATE; proxied bytes are metered.
  *
  * Boundaries: logged-out access to public listings only. Never log in or use accounts, never solve CAPTCHAs,
  * and on a block wait out the cooldown; don't rotate identity to get past it.

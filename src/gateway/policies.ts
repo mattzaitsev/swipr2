@@ -10,11 +10,11 @@ import { config } from '../config';
  * Baseline values per source. Strategies adjust behavior at runtime through primitives (strategy.ts).
  */
 export interface SourcePolicy {
-  minIntervalMs: number;             // politeness: minimum gap between requests to this source (per process); pacing floor
-  maxConcurrency: number;            // ceiling for in-flight requests per source (setConcurrency clamps to it); Infinity = no cap
+  minIntervalMs: number;             // baseline gap between requests (per process); strategies may override
+  maxConcurrency: number;            // baseline in-flight limit; strategies may override; Infinity = no cap
   timeoutMs: number;
-  throttledCooldownMs: number;       // cooldown floor after a throttle signal with no Retry-After
-  blockedCooldownMs: number;         // cooldown floor after a block / login wall
+  throttledCooldownMs: number;       // baseline cooldown after a throttle signal with no Retry-After
+  blockedCooldownMs: number;         // baseline cooldown after a block / login wall
   serverErrorCooldownMs: number;     // pause after a 5xx the strategy didn't retry
   changedPauseMs: number;            // pause for the whole source when its responses change shape (connector needs updating)
 }

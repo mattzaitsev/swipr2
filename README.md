@@ -1,9 +1,8 @@
-# swipr2 — Unrestricted marketplace aggregator skeleton
+# swipr2
 
-All guardrails removed. Strategies have full control over headers, session rotation, and recovery.
+Swipr's existing marketplace pipeline with strategy-controlled request handling. Strategies can override headers, pacing, concurrency, timeouts, cooldowns, retry decisions, and session rotation. The gateway imposes no policy floors or ceilings on these choices and no daily proxy-bandwidth stop.
 
-
-# swipr
+The default strategy still makes no retries and uses the original source-policy pacing, timeouts, and response cooldowns. Strategies decide their own retry termination. Connector implementations, normalization, database migrations, search, alerts, and API behavior are preserved.
 
 A marketplace aggregator, built to connect to Facebook Marketplace. It runs as a single-machine local MVP. It crawls location-scoped searches through a fetch gateway, normalizes listings into Postgres/PostGIS, indexes them in Typesense, and alerts saved searches when new matches appear.
 
@@ -53,12 +52,11 @@ PROXY_USERNAME=...
 PROXY_PASSWORD=...
 PROXY_USERNAME_TEMPLATE={user}-country-{country}[-region-{region}][-session-{session}-sesstime-{ttl}]
 PROXY_SOURCES=facebook        # only these sources use the proxy; the mock never does
-PROXY_DAILY_MB=200            # hard daily cap on proxied bandwidth
 ```
 
 - **Username template.** Copy the exact format from your provider's docs. `[…]` marks optional parts, dropped when a placeholder inside them is empty. That way one template covers both rotating requests (no session) and sticky ones.
 - **Sticky sessions.** These come from connector flows: every page of one search shares a session, so one exit IP serves the whole search. The exit location follows the search area.
-- **Budget.** Proxied bytes are counted per day in Redis. When `PROXY_DAILY_MB` runs out, crawling pauses until midnight UTC.
+- **Usage.** Proxied bytes are counted per day in Redis (`swipr:proxy-bytes:YYYY-MM-DD`). This includes response bytes, request-body bytes, and an estimate for protocol overhead; it is not the provider's exact billing figure. Metering does not stop requests.
 
 ## Shaped for Facebook Marketplace
 
@@ -71,7 +69,7 @@ PROXY_DAILY_MB=200            # hard daily cap on proxied bandwidth
 | Search results have approximate coordinates, or only a city | `geo_precision` records which: `approximate` when the source gave coordinates, `area` when it falls back to the search area's centre. A fallback never overwrites known coordinates. |
 | Sellers show a struck-through "was" price | `original_price_cents`, alongside our own observed `price_history`. |
 | Image URLs are signed and expire (`oe=`) | `listing_images.expires_at`. The signature is left out of change detection, so a new signature isn't counted as an update. URLs stay out of the search index; the API reads fresh ones from Postgres. |
-| Failures arrive inside HTTP 200 (rate limits, login walls), and `doc_id`s rotate | The connector's `classifyResponse` reads these signals and the gateway acts. Throttled pauses the search. Blocked pauses the whole source. A changed shape fails, alerts once, and pauses the source until a restart. |
+| Failures arrive inside HTTP 200 (rate limits, login walls), and `doc_id`s rotate | The connector's `classifyResponse` reads these signals. By default, throttled pauses the search, blocked pauses the source, and a changed shape raises `SourceChanged`. A strategy can choose its own cooldown, retry, or return the response to the connector. |
 | Sellers are people | Display name and kind only. The crawler never follows sellers to their profiles. |
 
 ## Facebook Marketplace: where it plugs in
@@ -84,10 +82,7 @@ PROXY_DAILY_MB=200            # hard daily cap on proxied bandwidth
 6. **Proxy:** the env vars above. Add `facebook` to `PROXY_SOURCES`; it's already the default.
 7. **Alerts to a human:** the `SourceChanged` handler in `src/ingest/worker.ts`.
 
-Boundaries in the design:
-- Logged-out access to public listings only.
-- No accounts, no CAPTCHA solving, no browser-fingerprint headers.
-- On a block, wait out the cooldown. Identity changes only after proxy-side failures.
+The built-in connector skeleton targets logged-out public listings; account login and CAPTCHA handling are not implemented. The gateway does not restrict identity headers or require waiting after a block. Those decisions belong to the selected strategy.
 
 ## Request strategies
 
@@ -95,19 +90,23 @@ Boundaries in the design:
 
 | Hook | When | What a strategy can do |
 |---|---|---|
-| `beforeRequest` | Before every attempt | Add ordinary headers, add delay, choose a sticky or rotating session |
+| `beforeRequest` | Before every attempt | Set any headers, add delay, choose a sticky or rotating session, override the timeout (`setTimeout(0, reason)` disables it) |
 | `afterResponse` | After the response is classified | Observe; adjust pacing or concurrency for later requests |
-| `onVerdict` | Throttled or blocked | Choose cooldown length and scope at or above the floor; slow the source |
-| `onRetryableError` | Proxy/network failure or target 5xx | Retry (bounded by `REQUEST_MAX_ATTEMPTS`) or give up. `rotateSession` is present only for proxy-side failures |
+| `onVerdict` | Throttled, blocked, or changed response | Choose cooldown length and scope; rotate the session; return `{ action: 'retry', delayMs, reason }` to retry in the same gateway call or `{ action: 'return' }` to pass the response to the connector |
+| `onRetryableError` | Proxy/network failure or target 5xx | Retry or give up; rotate the session on any failure side. The strategy decides the number of attempts and delay |
 
 **Recovery primitives** are available in every hook, bound to the request's source. They're also public on the gateway for ops tooling:
-- `setMinInterval`: pacing, never below the policy value.
-- `setConcurrency`: 1 up to the policy's `maxConcurrency`.
+- `setMinInterval`: pacing; 0 removes spacing, even when the baseline policy is slower.
+- `setConcurrency`: any positive integer, or `Infinity` to remove the gateway's in-flight cap.
 - `delayNext`: a one-shot delay before the next request.
 
 Cooldowns are set through `onVerdict`. Session rotation is offered in `onVerdict` and `onRetryableError`. Built-in examples, registered but off by default:
 - `retry-proxy-once`: retries a proxy failure once on a fresh session.
 - `conservative-backoff`: doubles the throttle cooldown and drops concurrency to 1.
+
+Returning nothing (or `give_up`) from `onVerdict` keeps baseline handling, with any chosen cooldown applied. An explicit cooldown also overrides the default `SourceChanged` pause. Zero or expired cooldowns create no worker pause; a deferred crawl still ends and the scheduler starts a later run. Use an explicit `retry` decision for another attempt within the same gateway call.
+
+Swipr1's `CONNECTOR_IDENTITY_HEADERS`, `REQUEST_MAX_ATTEMPTS`, `STRATEGY_MAX_DELAY_MS`, and `PROXY_DAILY_MB` settings are no longer read. Strategies own these decisions. Nonnegative delays and a positive concurrency value are required for meaningful timer and queue operation; these are input-domain rules, not source-policy limits.
 
 **Settings** live in the `RequestStrategySettings` type in `src/config.ts`: session mode, headers, timing ranges, retries and event logging. They load from env, and the defaults change nothing. Per-source baselines are in `src/gateway/policies.ts`.
 
@@ -116,6 +115,7 @@ Cooldowns are set through `onVerdict`. Session rotation is offered in `onVerdict
 - session starts and rotations
 - headers (names only)
 - timing, pacing and concurrency changes
+- timeout changes
 - cooldown decisions
 - error classification and retries
 
@@ -142,6 +142,8 @@ curl -H "x-user-id: me" localhost:4200/saved-searches/1/hits
 **Saved searches** match listings that arrive after the search is created.
 
 ## Testing failure modes against the mock (zero cost)
+
+`npm test` runs gateway and worker-cooldown regressions using an in-process HTTP mock with network access disabled. It needs no services, proxies, or paid bandwidth. `npm run typecheck` checks all TypeScript sources. The stack smoke test (`npm run smoke`) still requires the running local Postgres/Redis/Typesense/app stack.
 
 | Set in `.env`, then `docker compose up -d` | You should see |
 |---|---|

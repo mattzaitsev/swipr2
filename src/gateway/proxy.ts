@@ -12,7 +12,7 @@ const flowKey = (req: GatewayRequest) => {
   return `${req.source}|${req.sessionKey}|${geo}`;
 };
 
-// Generation per flow: rotating a session (proxy-side failures only) bumps it, which yields a new session id.
+// Generation per flow: strategy-requested rotation bumps it, which yields a new session id.
 const generations = new Map<string, number>();
 
 /** Stable session id per (source, sessionKey, geo, generation): all requests of one flow keep the same exit IP. */

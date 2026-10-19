@@ -4,8 +4,8 @@
  *
  *   beforeRequest    -> headers, delay, sticky/rotating session, pacing/concurrency for the source
  *   afterResponse    -> observe the classified response; adjust pacing/concurrency for later requests
- *   onVerdict        -> a throttle or block: choose cooldown length and scope, rotate session, slow the source
- *   onRetryableError -> proxy/network failure or target 5xx: retry (bounded) or give up; rotate session
+ *   onVerdict        -> throttle, block or changed response: defer, retry, or return the response; rotate session
+ *   onRetryableError -> proxy/network failure or target 5xx: retry or give up; rotate session
  *
  * Recovery levers are primitives (SourceControls below), so a strategy composes its own policy from them instead of
  * picking from fixed behaviors. The same primitives are public on the gateway (GatewayControls) for ops tooling.
@@ -49,6 +49,7 @@ export interface Failure {
 }
 
 export type RetryDecision = { action: 'retry'; delayMs: number; reason: string } | { action: 'give_up' };
+export type VerdictDecision = RetryDecision | { action: 'return' };
 
 /**
  * Recovery primitives, implemented by the gateway. Public on the gateway for ops tooling (with an explicit `by`);
@@ -57,9 +58,9 @@ export type RetryDecision = { action: 'retry'; delayMs: number; reason: string }
 export interface GatewayControls {
   /** Minimum gap between requests to a source. Returns the effective value. */
   setMinInterval(source: string, ms: number, reason: string, by?: string): number;
-  /** Cap in-flight requests to a source. Clamped to 1..policy.maxConcurrency. Returns the effective value. */
+  /** Set in-flight requests for a source, without a policy ceiling. Infinity disables the cap. Minimum 1. */
   setConcurrency(source: string, limit: number, reason: string, by?: string): number;
-  /** One-shot extra delay before the next request to a source (capped by settings.timing.maxStrategyDelayMs). */
+  /** One-shot extra delay before the next request to a source. */
   delayNext(source: string, ms: number, reason: string, by?: string): number;
 }
 
@@ -75,8 +76,10 @@ export interface SourceControls {
 export interface BeforeActions extends SourceControls {
   /** Add or override any header (including user-agent and sec-ch-ua*). */
   setHeader(name: string, value: string, reason: string): void;
-  /** Wait this much longer before this request (capped by settings.timing.maxStrategyDelayMs). */
+  /** Wait this much longer before this request. */
   addDelay(ms: number, reason: string): void;
+  /** Override the request timeout in milliseconds; 0 disables it. Baseline: policy.timeoutMs. */
+  setTimeout(ms: number, reason: string): void;
   /** Sticky = keep the flow's exit IP; rotating = new exit IP per request. */
   useSessionMode(mode: 'sticky' | 'rotating', reason: string): void;
 }
@@ -84,7 +87,7 @@ export interface BeforeActions extends SourceControls {
 export type AfterActions = SourceControls;
 
 export interface VerdictActions extends SourceControls {
-  /** Set this cooldown's length and scope (no floor clamped). */
+  /** Set this cooldown's length and scope, including zero; applies to changed responses too. */
   cooldown(ms: number, scope: CooldownScope, reason: string): void;
   /** Move this flow to a fresh proxy session on a target throttle or block. */
   rotateSession(reason: string): void;
@@ -99,8 +102,9 @@ export interface RequestStrategy {
   readonly name: string;
   beforeRequest?(ctx: RequestContext, act: BeforeActions): void | Promise<void>;
   afterResponse?(ctx: RequestContext, res: ResponseInfo, act: AfterActions): void | Promise<void>;
-  /** Throttled/blocked. `proposed` is the baseline cooldown; call act.cooldown() or act.rotateSession() freely. */
-  onVerdict?(ctx: RequestContext, res: ResponseInfo, proposed: Readonly<CooldownPlan>, act: VerdictActions): void | Promise<void>;
+  /** Throttled/blocked/changed. Return retry or return to override baseline handling. Otherwise defer as usual. */
+  onVerdict?(ctx: RequestContext, res: ResponseInfo, proposed: Readonly<CooldownPlan>, act: VerdictActions):
+    VerdictDecision | void | Promise<VerdictDecision | void>;
   onRetryableError?(ctx: RequestContext, failure: Failure, act: FailureActions): RetryDecision | Promise<RetryDecision>;
 }
 
